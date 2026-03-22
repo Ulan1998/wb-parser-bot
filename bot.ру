@@ -1,0 +1,115 @@
+import logging
+import requests
+import time
+import random
+import os
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+TOKEN = os.environ.get("BOT_TOKEN")
+
+logging.basicConfig(level=logging.INFO)
+
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://www.wildberries.ru/",
+}
+
+def get_supplier_id(brand_name):
+    api_url = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+    queries = [brand_name + " пиджак", brand_name + " одежда", brand_name]
+    for query in queries:
+        for attempt in range(3):
+            try:
+                params = {
+                    "query": query,
+                    "resultset": "catalog",
+                    "limit": 10,
+                    "appType": 1,
+                    "curr": "rub",
+                    "locale": "ru",
+                    "dest": -1257786,
+                }
+                r = requests.get(api_url, params=params, headers=headers, timeout=15)
+                if r.status_code != 200 or not r.text.strip():
+                    time.sleep(3)
+                    continue
+                products = r.json().get("data", {}).get("products", [])
+                if not products:
+                    break
+                brand_lower = brand_name.lower()
+                for p in products:
+                    wb_brand = str(p.get("brand", "")).lower()
+                    if brand_lower in wb_brand:
+                        return p.get("supplierId")
+                return products[0].get("supplierId")
+            except:
+                time.sleep(3)
+                continue
+    return None
+
+def get_inn(supplier_id):
+    try:
+        url = f"https://static-basket-01.wbbasket.ru/vol0/data/supplier-by-id/{supplier_id}.json"
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        return {
+            "inn": data.get("inn", "нет"),
+            "fullName": data.get("supplierFullName", ""),
+            "supplierName": data.get("supplierName", ""),
+        }
+    except:
+        return {"inn": "ошибка", "fullName": "", "supplierName": ""}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Отправь мне txt файл со списком брендов (каждый бренд на новой строке) — я найду ИНН каждого."
+    )
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = await update.message.document.get_file()
+    file_path = f"/tmp/brands_{update.message.chat_id}.txt"
+    await file.download_to_drive(file_path)
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        brands = [line.strip() for line in f.readlines() if line.strip()]
+
+    await update.message.reply_text(f"Загружено {len(brands)} брендов. Начинаю парсинг...")
+
+    results = []
+    found = 0
+
+    for i, brand in enumerate(brands):
+        supplier_id = get_supplier_id(brand)
+        if supplier_id:
+            info = get_inn(supplier_id)
+            results.append(f"{brand};{supplier_id};{info['inn']};{info['fullName']}")
+            found += 1
+        else:
+            results.append(f"{brand};;не найден;")
+
+        if (i + 1) % 50 == 0:
+            await update.message.reply_text(f"Прогресс: {i+1}/{len(brands)} — найдено {found}")
+
+        time.sleep(random.uniform(3, 6))
+
+    result_path = f"/tmp/result_{update.message.chat_id}.csv"
+    with open(result_path, "w", encoding="utf-8-sig") as f:
+        f.write("Бренд;Supplier ID;ИНН;Юрлицо\n")
+        f.write("\n".join(results))
+
+    await update.message.reply_document(
+        document=open(result_path, "rb"),
+        filename="result_inn.csv",
+        caption=f"Готово! Найдено {found} из {len(brands)}"
+    )
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
